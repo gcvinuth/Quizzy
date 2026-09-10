@@ -1,0 +1,90 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Quiz Room — host a live quiz with friends</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<div class="app-shell">
+
+  <div class="brand">
+    <div class="brand-mark"><span class="dot"></span>Quiz Room</div>
+    <div class="brand-sub" id="brandSub"></div>
+  </div>
+
+  <!-- ============ HOME VIEW ============ -->
+  <div class="view active" id="view-home">
+
+    <div class="config-warning" id="configWarning" style="display:none;">
+      This site isn't connected to a database yet. Open <code>firebase-config.js</code> and paste in your own
+      free Firebase project's config (see <code>README.md</code>) — that's the only setup step, and it's what lets
+      a room created on one device show up on a friend's device.
+    </div>
+
+    <div class="home-hero">
+      <h1>Quiz your friends, live.</h1>
+      <p>Open a room, drop in a mix of multiple-choice and open-ended questions, and share a short code. Everyone answers from their own phone in real time.</p>
+    </div>
+
+    <div class="split">
+      <div>
+        <div class="panel-label">Host</div>
+        <h2>Start a room</h2>
+        <p class="hint">You'll get a room code to share, then you can build your question set before anyone starts answering.</p>
+        <div class="field">
+          <label for="hostNameInput">Your name</label>
+          <input type="text" id="hostNameInput" placeholder="e.g. Priya" maxlength="24">
+        </div>
+        <button class="btn btn-primary btn-block" id="hostNameBtn" type="button">Create room</button>
+        <div class="error-msg" id="hostError"></div>
+      </div>
+
+      <div class="split-divider"></div>
+
+      <div>
+        <div class="panel-label rose">Join</div>
+        <h2>Enter a room</h2>
+        <p class="hint">Got a code from a friend? Pop in your name and the code to join their room.</p>
+        <div class="field">
+          <label for="joinNameInput">Your name</label>
+          <input type="text" id="joinNameInput" placeholder="e.g. Sam" maxlength="24">
+        </div>
+        <div class="field">
+          <label for="joinCodeInput">Room code</label>
+          <input type="text" id="joinCodeInput" class="code-input" placeholder="ABCDE" maxlength="8">
+        </div>
+        <button class="btn btn-secondary btn-block" id="joinBtn" type="button">Join room</button>
+        <div class="error-msg" id="joinError"></div>
+      </div>
+    </div>
+
+    <p class="footnote">Works entirely in the browser — no app to install. Room data lives only for the duration of your game.</p>
+  </div>
+
+  <!-- ============ ROOM VIEW (host + player share this shell) ============ -->
+  <div class="view" id="view-room">
+    <div class="room-topbar">
+      <div class="room-code-block">
+        <span class="room-code-label">Room code</span>
+        <span class="room-code-value" id="topbarCode">—</span>
+        <button class="copy-btn" id="copyCodeBtn" type="button">Copy</button>
+      </div>
+      <div style="display:flex; align-items:center; gap:10px;">
+        <span class="status-pill" id="statusPill">—</span>
+        <button class="subtle-link" id="leaveBtn" type="button">Leave</button>
+      </div>
+    </div>
+    <div id="roomContent"></div>
+  </div>
+
+</div>
+
+<script src="https://www.gstatic.com/firebasejs/10.13.1/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.13.1/firebase-database-compat.js"></script>
+<script src="firebase-config.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
