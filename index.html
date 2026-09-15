@@ -2,8 +2,8 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<meta name="theme-color" content="#09070F">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<meta name="theme-color" content="#F1EDF6">
 <title>Quiz Room — host a live quiz with friends</title>
 <link rel="stylesheet" href="style.css">
 </head>
@@ -13,7 +13,10 @@
 
   <div class="brand">
     <div class="brand-mark"><span class="dot"></span>Quiz Room</div>
-    <div class="brand-sub" id="brandSub"></div>
+    <div style="display:flex; align-items:center; gap:14px;">
+      <div class="brand-sub" id="brandSub"></div>
+      <button class="theme-toggle" id="themeToggleBtn" type="button" title="Switch theme" aria-label="Switch light/dark theme">🌙</button>
+    </div>
   </div>
 
   <!-- ============ HOME VIEW ============ -->
@@ -83,9 +86,14 @@
 
 </div>
 
+<div class="toast-host" id="toastHost" aria-live="polite"></div>
+<div class="confetti-layer" id="confettiLayer" aria-hidden="true"></div>
+
 <script src="https://www.gstatic.com/firebasejs/10.13.1/firebase-app-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.13.1/firebase-database-compat.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
 <script src="firebase-config.js"></script>
+<script src="ai-config.js"></script>
 <script src="app.js"></script>
 </body>
 </html>
