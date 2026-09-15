@@ -18,6 +18,9 @@ if (CONFIGURED) {
   db = firebase.database();
 }
 
+const AI_CONFIGURED = typeof aiConfig !== 'undefined' &&
+  !!aiConfig.apiKey && aiConfig.apiKey !== "YOUR_ANTHROPIC_API_KEY";
+
 const MY_ID = getOrCreateMyId();
 let session = loadSession();      // { code, role: 'host'|'player', name }
 let currentRoomData = null;
@@ -27,7 +30,29 @@ let roomListener = null;
 let draftQuestions = [];          // host-only, local until "Start game"
 let builderType = 'objective';
 let builderOptions = ['', ''];
+let builderTextDraft = '';
+let builderTimerDraft = '';
+let builderCorrectIndex = 0;
+let editingDraftIndex = null;     // set while editing an existing draft question
 let selectedAnswerThisRender = null; // guards double-submit on objective click
+
+let aiTopicDraft = '';            // host-only, remembers AI panel input across re-renders
+let aiCountDraft = 5;
+let aiGenState = 'idle';          // 'idle' | 'loading' | 'error'
+let aiGenError = '';
+
+let liveAddOpen = false;          // host-only, mid-game "add question" panel
+let liveBuilderType = 'objective';
+let liveBuilderOptions = ['', ''];
+let liveBuilderTimer = '';
+let liveAddBusy = false;
+
+let serverOffset = 0;             // ms offset between local clock and Firebase server clock
+let lastAutoRevealIndex = null;   // guards against re-triggering auto-reveal for the same question
+let lastPlayerTimerRenderIndex = null;
+let timerTickHandle = null;
+
+let theme = localStorage.getItem('qr_theme') || 'light';
 
 // ---------- storage helpers ----------
 
@@ -85,9 +110,180 @@ function showView(id) {
   document.getElementById(id).classList.add('active');
 }
 
+function joinLinkForCode(code) {
+  return location.origin + location.pathname + '?join=' + encodeURIComponent(code);
+}
+
+// ---------- toasts ----------
+
+function showToast(message, kind) {
+  const host = document.getElementById('toastHost');
+  if (!host) return;
+  const el = document.createElement('div');
+  el.className = 'toast' + (kind === 'warn' ? ' warn' : '');
+  el.textContent = message;
+  host.appendChild(el);
+  setTimeout(() => el.remove(), 3400);
+}
+
+// ---------- confetti ----------
+
+function launchConfetti() {
+  const layer = document.getElementById('confettiLayer');
+  if (!layer) return;
+  const colors = ['#8FB39B', '#E3A7A0', '#E8B75E', '#6B9880', '#CB817A'];
+  for (let i = 0; i < 46; i++) {
+    const piece = document.createElement('div');
+    piece.className = 'confetti-piece';
+    piece.style.left = Math.random() * 100 + 'vw';
+    piece.style.background = colors[i % colors.length];
+    piece.style.animationDuration = (2.2 + Math.random() * 1.6) + 's';
+    piece.style.animationDelay = (Math.random() * 0.5) + 's';
+    piece.style.borderRadius = Math.random() < 0.5 ? '50%' : '2px';
+    layer.appendChild(piece);
+    setTimeout(() => piece.remove(), 4600);
+  }
+}
+
+// ---------- theme ----------
+
+function applyTheme() {
+  document.documentElement.setAttribute('data-theme', theme);
+  const btn = document.getElementById('themeToggleBtn');
+  if (btn) btn.textContent = theme === 'dark' ? '☀️' : '🌙';
+}
+
+function toggleTheme() {
+  theme = theme === 'dark' ? 'light' : 'dark';
+  localStorage.setItem('qr_theme', theme);
+  applyTheme();
+}
+
+// ---------- per-question timer ----------
+// Ticks independently of the Firebase-driven re-renders so a countdown can move
+// smoothly without redrawing (and losing focus on) the whole room panel.
+
+function tickActiveTimer() {
+  const data = currentRoomData;
+  if (!data || data.status !== 'active' || !session) return;
+  const q = data.questions && data.questions[data.currentIndex];
+  if (!q || !q.timerSeconds) return;
+
+  const fill = document.getElementById('timerFill');
+  const text = document.getElementById('timerText');
+  if (!fill && !text) return; // not currently rendered
+
+  const now = Date.now() + serverOffset;
+  const startedAt = data.questionStartedAt || now;
+  const totalMs = q.timerSeconds * 1000;
+  const remainingMs = Math.max(0, startedAt + totalMs - now);
+  const pct = Math.max(0, Math.min(100, (remainingMs / totalMs) * 100));
+
+  if (fill) {
+    fill.style.width = pct + '%';
+    fill.classList.toggle('low', remainingMs <= 5000);
+  }
+  if (text) text.textContent = Math.ceil(remainingMs / 1000) + 's';
+
+  if (remainingMs <= 0) {
+    if (session.role === 'host' && !data.revealed && lastAutoRevealIndex !== data.currentIndex) {
+      lastAutoRevealIndex = data.currentIndex;
+      roomRef.update({ revealed: true });
+    }
+    if (session.role === 'player' && lastPlayerTimerRenderIndex !== data.currentIndex) {
+      lastPlayerTimerRenderIndex = data.currentIndex;
+      renderPlayer(data); // re-render once to lock the answer UI
+    }
+  }
+}
+
+function timerBlockHtml(q) {
+  if (!q.timerSeconds) return '';
+  return `
+    <div class="timer-block">
+      <div class="timer-bar-track"><div class="timer-bar-fill" id="timerFill"></div></div>
+      <div class="timer-text" id="timerText">${q.timerSeconds}s</div>
+    </div>
+  `;
+}
+
+// ---------- AI quiz generation ----------
+// Calls the Anthropic API directly from the browser (uses the key in ai-config.js)
+// and turns the response into an array of objective (multiple-choice) questions
+// in the same shape the manual question builder produces.
+
+async function generateQuizWithAI(topic, count) {
+  const prompt = `Write ${count} original multiple-choice quiz questions on this topic: "${topic}".
+
+Respond with ONLY a raw JSON array — no markdown code fences, no commentary before or after it.
+Each array item must look exactly like this:
+{"text": "question text", "options": ["option A", "option B", "option C", "option D"], "correctIndex": 0}
+
+Rules:
+- Exactly 4 answer options per question.
+- "correctIndex" is the 0-based index into "options" of the single correct answer.
+- Questions must be original wording (a quiz ABOUT the topic), not copied passages of any source text.
+- Vary which option index is correct across questions — don't always make it 0.
+- Keep each question under 160 characters and each option under 60 characters.
+- Return exactly ${count} items, no more, no fewer.`;
+
+  const res = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-api-key": aiConfig.apiKey,
+      "anthropic-version": "2023-06-01",
+      "anthropic-dangerous-direct-browser-access": "true"
+    },
+    body: JSON.stringify({
+      model: "claude-sonnet-4-6",
+      max_tokens: 4096,
+      messages: [{ role: "user", content: prompt }]
+    })
+  });
+
+  if (!res.ok) {
+    let detail = '';
+    try { detail = (await res.json()).error?.message || ''; } catch (e) { /* ignore */ }
+    if (res.status === 401) throw new Error('That API key was rejected. Check ai-config.js.');
+    throw new Error('AI request failed' + (detail ? ': ' + detail : ` (status ${res.status}).`));
+  }
+
+  const data = await res.json();
+  const textBlock = (data.content || []).find(b => b.type === 'text');
+  if (!textBlock || !textBlock.text) throw new Error('The AI returned an empty response.');
+
+  let raw = textBlock.text.trim();
+  raw = raw.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '').trim();
+
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (e) {
+    throw new Error('Could not read the AI\'s response as a question list. Try again.');
+  }
+  if (!Array.isArray(parsed) || parsed.length === 0) {
+    throw new Error('The AI response wasn\'t in the expected format. Try again.');
+  }
+
+  const questions = parsed.map(q => {
+    const text = String(q && q.text || '').trim();
+    const options = Array.isArray(q && q.options) ? q.options.map(o => String(o).trim()).filter(Boolean) : [];
+    let correctIndex = Number.isInteger(q && q.correctIndex) ? q.correctIndex : 0;
+    if (correctIndex < 0 || correctIndex >= options.length) correctIndex = 0;
+    return { type: 'objective', text, options, correctIndex };
+  }).filter(q => q.text && q.options.length >= 2);
+
+  if (questions.length === 0) throw new Error('The AI didn\'t return any usable questions. Try rephrasing the topic.');
+  return questions;
+}
+
 // ---------- boot ----------
 
 document.addEventListener('DOMContentLoaded', () => {
+  applyTheme();
+  document.getElementById('themeToggleBtn').addEventListener('click', toggleTheme);
+
   if (!CONFIGURED) {
     document.getElementById('configWarning').style.display = 'block';
     document.getElementById('hostNameBtn').disabled = true;
@@ -98,10 +294,27 @@ document.addEventListener('DOMContentLoaded', () => {
   document.getElementById('leaveBtn').addEventListener('click', leaveRoom);
   document.getElementById('copyCodeBtn').addEventListener('click', copyCode);
 
+  // Prefill the join code from a shared invite link (?join=CODE)
+  const params = new URLSearchParams(location.search);
+  const joinParam = params.get('join');
+  if (joinParam && !session) {
+    document.getElementById('joinCodeInput').value = joinParam.toUpperCase();
+    document.getElementById('joinNameInput').focus();
+  }
+
   if (session && CONFIGURED) {
     attachToRoom(session.code);
     showView('view-room');
   }
+
+  if (CONFIGURED) {
+    db.ref('.info/serverTimeOffset').on('value', snap => { serverOffset = snap.val() || 0; });
+    db.ref('.info/connected').on('value', snap => {
+      if (snap.val() === false && session) showToast('Connection lost — reconnecting…', 'warn');
+    });
+  }
+
+  timerTickHandle = setInterval(tickActiveTimer, 400);
 });
 
 // ---------- home screen ----------
@@ -223,6 +436,10 @@ function leaveRoom() {
   currentRoomData = null;
   clearSession();
   draftQuestions = [];
+  editingDraftIndex = null;
+  liveAddOpen = false;
+  lastAutoRevealIndex = null;
+  lastPlayerTimerRenderIndex = null;
   document.getElementById('hostNameInput').value = '';
   document.getElementById('joinNameInput').value = '';
   document.getElementById('joinCodeInput').value = '';
@@ -237,7 +454,12 @@ function attachToRoom(code) {
   roomListener = roomRef.on('value', snap => {
     const data = snap.val();
     if (!data) {
-      alert('This room no longer exists.');
+      showToast('This room no longer exists.', 'warn');
+      leaveRoom();
+      return;
+    }
+    if (session && session.role === 'player' && data.kicked && data.kicked[MY_ID]) {
+      showToast('The host removed you from this room.', 'warn');
       leaveRoom();
       return;
     }
@@ -283,8 +505,13 @@ function renderHost(data) {
 function hostLobbyHtml(data) {
   const players = sortedPlayers(data);
   const playersHtml = players.length
-    ? `<div class="player-chip-list">${players.map(p => `<span class="player-chip"><span class="avatar-dot"></span>${escapeHtml(p.name)}</span>`).join('')}</div>`
-    : `<p class="empty-note">Nobody has joined yet. Share the code above.</p>`;
+    ? `<div class="player-chip-list">${players.map(p => `
+        <span class="player-chip kickable">
+          <span class="avatar-dot"></span>${escapeHtml(p.name)}
+          <button class="kick-btn" data-kick="${p.id}" title="Remove ${escapeHtml(p.name)}" type="button">✕</button>
+        </span>
+      `).join('')}</div>`
+    : `<p class="empty-note">Nobody has joined yet. Share the code or QR below.</p>`;
 
   const qListHtml = draftQuestions.length
     ? draftQuestions.map((q, i) => `
@@ -294,28 +521,62 @@ function hostLobbyHtml(data) {
             <div class="qmeta">
               <span class="tag ${q.type}">${q.type === 'objective' ? 'Objective' : 'Subjective'}</span>
               ${q.type === 'objective' ? ` &middot; ${q.options.length} options` : ''}
+              ${q.timerSeconds ? ` &middot; ${q.timerSeconds}s timer` : ''}
             </div>
           </div>
-          <button class="remove-link" data-remove="${i}">Remove</button>
+          <div class="q-actions">
+            <button class="icon-link" data-move-up="${i}" title="Move up" type="button" ${i === 0 ? 'disabled' : ''}>↑</button>
+            <button class="icon-link" data-move-down="${i}" title="Move down" type="button" ${i === draftQuestions.length - 1 ? 'disabled' : ''}>↓</button>
+            <button class="icon-link" data-duplicate="${i}" title="Duplicate" type="button">⧉</button>
+            <button class="remove-link" data-edit="${i}">Edit</button>
+            <button class="remove-link" data-remove="${i}">Remove</button>
+          </div>
         </div>
       `).join('')
     : `<p class="empty-note">No questions added yet.</p>`;
 
+  const joinLink = joinLinkForCode(session.code);
+
   return `
+    <div class="invite-block">
+      <div class="invite-qr" id="qrCode"></div>
+      <div class="invite-info">
+        <div class="section-title" style="margin-bottom:4px;">Invite players</div>
+        <p class="hint" style="margin-bottom:0;">Share the code, scan the QR, or send the link — works across devices.</p>
+        <div class="invite-link-row">
+          <input type="text" readonly value="${joinLink}" id="inviteLinkInput" onclick="this.select()">
+          <button class="btn btn-ghost" id="copyLinkBtn" type="button">Copy link</button>
+        </div>
+      </div>
+    </div>
+
     <div class="two-col">
       <div>
+        ${aiPanelHtml()}
+
         <div class="section-title">Build your questions</div>
         <div class="q-builder">
+          ${editingDraftIndex !== null ? `<div class="editing-tag">Editing question ${editingDraftIndex + 1} — saving will update it in place</div>` : ''}
           <div class="type-toggle">
             <button type="button" data-type="objective" class="${builderType === 'objective' ? 'active' : ''}">Objective (multiple choice)</button>
             <button type="button" data-type="subjective" class="${builderType === 'subjective' ? 'active' : ''}">Subjective (open answer)</button>
           </div>
           <div class="field">
             <label for="qText">Question</label>
-            <textarea id="qText" placeholder="${builderType === 'objective' ? 'e.g. What year did the first moon landing happen?' : 'e.g. What is your favourite childhood memory?'}"></textarea>
+            <textarea id="qText" placeholder="${builderType === 'objective' ? 'e.g. What year did the first moon landing happen?' : 'e.g. What is your favourite childhood memory?'}">${escapeHtml(builderTextDraft)}</textarea>
           </div>
           ${builderType === 'objective' ? optionsBuilderHtml() : ''}
-          <button class="btn btn-primary" id="addQBtn" type="button">Add question</button>
+          <div class="timer-field-row">
+            <div class="field">
+              <label for="qTimer">Time limit (optional)</label>
+              <input type="number" id="qTimer" min="5" max="300" placeholder="No limit" value="${escapeHtml(builderTimerDraft)}">
+            </div>
+            <small>Seconds per question — leave blank for untimed.</small>
+          </div>
+          <div class="controls-bar" style="margin-top:14px;">
+            <button class="btn btn-primary" id="addQBtn" type="button">${editingDraftIndex !== null ? 'Save question' : 'Add question'}</button>
+            ${editingDraftIndex !== null ? `<button class="btn btn-ghost" id="cancelEditBtn" type="button">Cancel edit</button>` : ''}
+          </div>
           <div class="error-msg" id="builderError"></div>
         </div>
 
@@ -325,13 +586,47 @@ function hostLobbyHtml(data) {
         <div class="controls-bar">
           <button class="btn btn-secondary" id="startBtn" type="button" ${draftQuestions.length === 0 ? 'disabled' : ''}>Start game</button>
         </div>
-        <p class="footnote">Questions are drafted in your browser and go live once you hit "Start game" — try not to refresh this tab before then.</p>
+        <p class="footnote">Questions are drafted in your browser and go live once you hit "Start game" — you can still add more once the game is running.</p>
       </div>
 
       <div>
         <div class="section-title">Players (${sortedPlayers(data).length})</div>
         ${playersHtml}
       </div>
+    </div>
+  `;
+}
+
+function aiPanelHtml() {
+  if (!AI_CONFIGURED) {
+    return `
+      <div class="ai-not-configured">
+        <strong>Want AI-generated questions?</strong> Open <code>ai-config.js</code> and paste in an
+        Anthropic API key from <code>console.anthropic.com</code>. Once it's set, a "Generate with AI"
+        panel appears here — type a topic like <em>"Photosynthesis, Class 10 Science"</em> or
+        <em>"Chapter 5 of the Book of Mark"</em> and it'll draft multiple-choice questions for you.
+      </div>
+    `;
+  }
+
+  return `
+    <div class="ai-panel">
+      <div class="ai-panel-title"><span class="sparkle">✨</span> Generate with AI</div>
+      <p class="hint">Describe a topic — a subject and grade, a book chapter, anything — and get a ready-made multiple-choice quiz you can review and edit before starting.</p>
+      <div class="ai-gen-row">
+        <div class="field">
+          <label for="aiTopicInput">Topic</label>
+          <input type="text" id="aiTopicInput" placeholder="e.g. Photosynthesis, Class 10 Science" value="${escapeHtml(aiTopicDraft)}" maxlength="200">
+        </div>
+        <div class="field">
+          <label for="aiCountInput"># Questions</label>
+          <input type="number" id="aiCountInput" min="1" max="20" value="${aiCountDraft}">
+        </div>
+        <button class="btn btn-gold" id="aiGenerateBtn" type="button" ${aiGenState === 'loading' ? 'disabled' : ''}>
+          ${aiGenState === 'loading' ? 'Generating…' : 'Generate quiz'}
+        </button>
+      </div>
+      <div class="error-msg">${aiGenState === 'error' ? escapeHtml(aiGenError) : ''}</div>
     </div>
   `;
 }
@@ -343,7 +638,7 @@ function optionsBuilderHtml() {
       <div id="optionRows">
         ${builderOptions.map((val, i) => `
           <div class="option-row">
-            <input type="radio" name="correctOpt" value="${i}" id="opt-radio-${i}" ${i === 0 ? 'checked' : ''}>
+            <input type="radio" name="correctOpt" value="${i}" id="opt-radio-${i}" ${i === builderCorrectIndex ? 'checked' : ''}>
             <input type="text" data-opt-index="${i}" placeholder="Option ${i + 1}" value="${escapeHtml(val)}">
           </div>
         `).join('')}
@@ -354,6 +649,43 @@ function optionsBuilderHtml() {
 }
 
 function wireHostLobbyEvents(data) {
+  const aiTopicInput = document.getElementById('aiTopicInput');
+  const aiCountInput = document.getElementById('aiCountInput');
+  if (aiTopicInput) aiTopicInput.addEventListener('input', () => { aiTopicDraft = aiTopicInput.value; });
+  if (aiCountInput) aiCountInput.addEventListener('input', () => { aiCountDraft = aiCountInput.value; });
+
+  const aiGenerateBtn = document.getElementById('aiGenerateBtn');
+  if (aiGenerateBtn) {
+    aiGenerateBtn.addEventListener('click', () => {
+      const topic = (aiTopicInput ? aiTopicInput.value : aiTopicDraft).trim();
+      let count = parseInt(aiCountInput ? aiCountInput.value : aiCountDraft, 10);
+      if (!topic) {
+        aiGenState = 'error';
+        aiGenError = 'Enter a topic first — e.g. "Photosynthesis, Class 10" or "Chapter Mark from the Holy Bible".';
+        renderHost(data);
+        return;
+      }
+      if (!Number.isFinite(count) || count < 1) count = 5;
+      if (count > 20) count = 20;
+      aiTopicDraft = topic;
+      aiCountDraft = count;
+      aiGenState = 'loading';
+      aiGenError = '';
+      renderHost(data);
+
+      generateQuizWithAI(topic, count).then(questions => {
+        draftQuestions = draftQuestions.concat(questions);
+        aiGenState = 'idle';
+        aiTopicDraft = '';
+        renderHost(data);
+      }).catch(err => {
+        aiGenState = 'error';
+        aiGenError = err.message || 'Something went wrong generating the quiz.';
+        renderHost(data);
+      });
+    });
+  }
+
   document.querySelectorAll('[data-type]').forEach(btn => {
     btn.addEventListener('click', () => {
       builderType = btn.dataset.type;
